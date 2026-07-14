@@ -21,10 +21,14 @@ import plotly.graph_objects as go
 from _auth import init_auth
 
 # ── Credentials ────────────────────────────────────────────────────────────
-# GOOGLE_APPLICATION_CREDENTIALS_JSON holds the raw service-account JSON
-# (used on Render). When absent, the client falls back to ADC / gcloud
-# auth application-default login (used locally).
-_creds_json = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
+# GCP_SERVICE_ACCOUNT_JSON holds the raw service-account JSON (used on
+# Render). GOOGLE_APPLICATION_CREDENTIALS_JSON is accepted as an alias for
+# backward compatibility. When neither is set, the client falls back to
+# ADC / `gcloud auth application-default login` (used locally).
+_creds_json = (
+    os.environ.get("GCP_SERVICE_ACCOUNT_JSON")
+    or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
+)
 if _creds_json:
     _creds_info = json.loads(_creds_json)
     _credentials = service_account.Credentials.from_service_account_info(_creds_info)

@@ -22,6 +22,6 @@ services:
       - key: SECRET_KEY
         generateValue: true        # Render generates a strong random string
       # ── BigQuery credentials ───────────────────────────────────────────
-      # Paste the FULL service-account JSON key here (as a single line).
-      - key: GOOGLE_APPLICATION_CREDENTIALS_JSON
+      # Paste the FULL service-account JSON key here.
+      - key: GCP_SERVICE_ACCOUNT_JSON
         sync: false                # set in Render dashboard
