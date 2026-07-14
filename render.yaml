@@ -1,0 +1,27 @@
+# Render service definition. Point Render at this repo, choose "Blueprint"
+# and it'll create the web service using this file. All secret values must
+# be filled in via the Render dashboard after the first deploy — they are
+# left `sync: false` here so they never touch the repo.
+services:
+  - type: web
+    name: advocacy-fund-tracker
+    runtime: python
+    plan: free                     # bump to `starter` if the free tier sleeps
+    region: oregon                 # choose the region closest to your users
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn advo_tracker_test:server --workers 2 --threads 4 --timeout 120 --bind 0.0.0.0:$PORT
+    healthCheckPath: /login
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.5
+      # ── Auth (required to gate the dashboard) ──────────────────────────
+      - key: APP_USERNAME
+        sync: false                # set in Render dashboard
+      - key: APP_PASSWORD
+        sync: false                # set in Render dashboard
+      - key: SECRET_KEY
+        generateValue: true        # Render generates a strong random string
+      # ── BigQuery credentials ───────────────────────────────────────────
+      # Paste the FULL service-account JSON key here (as a single line).
+      - key: GOOGLE_APPLICATION_CREDENTIALS_JSON
+        sync: false                # set in Render dashboard
