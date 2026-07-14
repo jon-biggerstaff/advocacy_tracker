@@ -30,6 +30,7 @@ from flask import (
     session,
     url_for,
 )
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 SESSION_DAYS = 30
 
@@ -183,6 +184,22 @@ def init_auth(server: Flask) -> None:
     # on every restart, which is fine).
     server.secret_key = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
     server.permanent_session_lifetime = timedelta(days=SESSION_DAYS)
+
+    # When deployed on Render (auto-detected via the RENDER env var, which
+    # Render always sets), tell Flask to trust the X-Forwarded-Proto header
+    # from Render's edge proxy AND set the session cookie flags required
+    # for the cookie to survive being embedded in a cross-site iframe like
+    # Notion. Without this, Chrome silently drops the session cookie on the
+    # post-login redirect and the user gets bounced back to /login in a
+    # loop — the exact "login form takes creds but nothing happens" symptom
+    # seen when the dashboard is embedded in Notion.
+    if os.environ.get("RENDER") or os.environ.get("RENDER_EXTERNAL_HOSTNAME"):
+        server.wsgi_app = ProxyFix(server.wsgi_app, x_for=1, x_proto=1, x_host=1)
+        server.config.update(
+            SESSION_COOKIE_SAMESITE="None",  # allow cross-site iframe use
+            SESSION_COOKIE_SECURE=True,      # required when SameSite=None
+            SESSION_COOKIE_HTTPONLY=True,    # no JS access to the cookie
+        )
 
     @server.route("/login", methods=["GET", "POST"])
     def _login():
