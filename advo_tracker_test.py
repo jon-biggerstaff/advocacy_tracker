@@ -722,7 +722,10 @@ app.title = "Fundraising Tracker"
 # every other route behind a valid session cookie — but only if APP_USERNAME
 # and APP_PASSWORD are set. Locally without those set, auth is a no-op.
 server = app.server
-init_auth(server)
+# Auth temporarily disabled while we sort out the Notion iframe cookie
+# behavior. Re-enable by uncommenting the line below (env vars still work
+# the same — see _auth.py).
+# init_auth(server)
 
 app.index_string = f"""
 <!DOCTYPE html>
