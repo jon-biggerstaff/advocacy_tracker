@@ -9,7 +9,12 @@ services:
     plan: free                     # bump to `starter` if the free tier sleeps
     region: oregon                 # choose the region closest to your users
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn advo_tracker_test:server --workers 2 --threads 4 --timeout 120 --bind 0.0.0.0:$PORT
+    # Single worker with 4 threads. Multi-worker breaks Dash because each
+    # worker has its own component-registry (populated lazily on first
+    # layout render), so JS bundle requests routed to a "cold" worker 500
+    # with `"dash" is not a registered library. Registered libraries are: []`.
+    # 4 threads in one worker easily handles this dashboard's traffic.
+    startCommand: gunicorn advo_tracker_test:server --workers 1 --threads 4 --timeout 120 --preload --bind 0.0.0.0:$PORT
     healthCheckPath: /login
     envVars:
       - key: PYTHON_VERSION
