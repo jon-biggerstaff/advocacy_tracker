@@ -15,7 +15,7 @@ from google.cloud import bigquery
 from google.oauth2 import service_account
 
 import dash
-from dash import dcc, html, Input, Output, State
+from dash import dcc, html, Input, Output, State, ctx
 import plotly.graph_objects as go
 
 from _auth import init_auth
@@ -56,22 +56,56 @@ CAMPAIGN_LABELS = {
 
 DEFAULT_CAMPAIGN = "jolly"
 
-# ── Client + one-time data load ────────────────────────────────────────────
-# We pull the whole view once at startup and keep it resident. Every dropdown
-# selection then filters this frame in memory — no BigQuery round-trip per
-# switch. Trade-off: data is stale until the process restarts.
+# ── Client + cached data load ──────────────────────────────────────────────
+# The whole view is fetched once and cached in-memory. Every dropdown / goal
+# change filters this cached frame — no BigQuery round-trip per interaction.
+# The cache auto-refreshes on the following triggers:
+#   • the hourly `refresh-heartbeat` interval fires
+#   • a user clicks the manual refresh button
+#   • the process restarts (redeploy / cold start)
+# get_raw_df() is the single accessor used by build_dashboard().
 bq_client = bigquery.Client(project=PROJECT_ID, credentials=_credentials)
 table_id  = f"{PROJECT_ID}.{DATASET}.{TABLE}"
 
-raw_df = bq_client.query(f"""
-    SELECT source_campaign, actblue_custom_date, amount, recurs
-    FROM `{table_id}`
-""").to_dataframe()
+REFRESH_TTL      = timedelta(hours=1)
+DISPLAY_TIMEZONE = "America/Los_Angeles"
 
-raw_df["actblue_custom_date"] = pd.to_datetime(
-    raw_df["actblue_custom_date"], format="%Y-%m-%d %H:%M:%S"
-)
-raw_df["amount"] = pd.to_numeric(raw_df["amount"], errors="coerce")
+_data_cache: dict = {"df": None, "loaded_at": None}
+
+
+def _load_raw_df() -> pd.DataFrame:
+    """Blocking BigQuery pull + type normalization. Runs on refresh."""
+    df = bq_client.query(f"""
+        SELECT source_campaign, actblue_custom_date, amount, recurs
+        FROM `{table_id}`
+    """).to_dataframe()
+    df["actblue_custom_date"] = pd.to_datetime(
+        df["actblue_custom_date"], format="%Y-%m-%d %H:%M:%S"
+    )
+    df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
+    return df
+
+
+def get_raw_df(force: bool = False) -> tuple[pd.DataFrame, pd.Timestamp]:
+    """
+    Return (dataframe, loaded_at). Refreshes from BigQuery when force=True,
+    when the cache is empty, or when the cached copy is older than
+    REFRESH_TTL. `loaded_at` is a tz-aware timestamp for display.
+    """
+    now = pd.Timestamp.now(tz=DISPLAY_TIMEZONE)
+    stale = (
+        _data_cache["df"] is None
+        or _data_cache["loaded_at"] is None
+        or (now - _data_cache["loaded_at"]) >= REFRESH_TTL
+    )
+    if force or stale:
+        _data_cache["df"]        = _load_raw_df()
+        _data_cache["loaded_at"] = pd.Timestamp.now(tz=DISPLAY_TIMEZONE)
+    return _data_cache["df"], _data_cache["loaded_at"]
+
+
+# Warm the cache at import time so the first render has data ready.
+get_raw_df()
 
 # ══════════════════════════════════════════════════════════════════════════
 # DESIGN TOKENS
@@ -177,7 +211,10 @@ def build_dashboard(campaign: str, monthly_goal: int | None = None):
     monthly_goal = int(monthly_goal) if monthly_goal else CAMPAIGN_GOALS[campaign]
 
     # ── Filter master frame to this campaign ─────────────────────────────
-    df_all = raw_df[raw_df["source_campaign"] == campaign].copy()
+    # get_raw_df() serves the in-memory cache; refresh is driven by the
+    # hourly heartbeat and the manual button (see callbacks at bottom).
+    _raw_df, _ = get_raw_df()
+    df_all = _raw_df[_raw_df["source_campaign"] == campaign].copy()
 
     today               = pd.Timestamp.now()
     today_date          = today.date()
@@ -936,6 +973,55 @@ app.layout = html.Div([
                     ),
                 ], style={"display": "flex", "alignItems": "center"}),
             ], style={"marginLeft": "24px"}),
+
+            # Refresh controls — right-aligned via marginLeft: auto. The
+            # timestamp label is populated by the refresh callback; the
+            # button forces an immediate re-fetch from BigQuery.
+            html.Div([
+                html.Span(
+                    id="last-refresh-label",
+                    className="tt",
+                    title=(
+                        "The dashboard caches BigQuery data in memory. "
+                        "It auto-refreshes every hour and can be refreshed "
+                        "on demand with the button to the right."
+                    ),
+                    style={
+                        "fontFamily": FONT_MONO,
+                        "fontSize": "10px",
+                        "letterSpacing": "1.5px",
+                        "textTransform": "uppercase",
+                        "color": MUTED,
+                        "marginRight": "12px",
+                        "whiteSpace": "nowrap",
+                        "borderBottom": f"1px dotted {LABEL_COLOR}",
+                        "paddingBottom": "2px",
+                    },
+                ),
+                html.Button("↻ Refresh",
+                    id="refresh-button",
+                    n_clicks=0,
+                    className="tt",
+                    title="Force a fresh pull from BigQuery now.",
+                    style={
+                        "fontFamily": FONT_MONO,
+                        "fontSize": "11px",
+                        "letterSpacing": "1.5px",
+                        "textTransform": "uppercase",
+                        "color": LABEL_COLOR,
+                        "background": SURFACE,
+                        "border": f"1px solid {BORDER}",
+                        "borderRadius": "8px",
+                        "padding": "0 14px",
+                        "height": "36px",
+                        "cursor": "pointer",
+                    },
+                ),
+            ], style={
+                "display": "flex",
+                "alignItems": "center",
+                "marginLeft": "auto",
+            }),
         ], style={
             "display": "flex",
             "alignItems": "flex-end",
@@ -944,6 +1030,13 @@ app.layout = html.Div([
 
         # ── Dynamic content, rebuilt on every dropdown / goal change ─────
         html.Div(id="dashboard-content"),
+
+        # ── Refresh plumbing (invisible) ─────────────────────────────────
+        # Heartbeat fires once an hour; the callback below force-reloads
+        # the BigQuery cache and updates data-refresh-store, which every
+        # visible piece (dashboard content + timestamp label) depends on.
+        dcc.Interval(id="refresh-heartbeat", interval=int(REFRESH_TTL.total_seconds() * 1000), n_intervals=0),
+        dcc.Store(id="data-refresh-store"),
 
     ], style={
         "maxWidth": "1400px",
@@ -998,10 +1091,49 @@ def _reset_goal(campaign):
 @app.callback(
     Output("dashboard-content", "children"),
     Input("goal-input", "value"),
+    Input("data-refresh-store", "data"),
     State("campaign-dropdown", "value"),
 )
-def _render(goal, campaign):
+def _render(goal, _refresh_ts, campaign):
+    # _refresh_ts is unused inside the function but declaring it as an Input
+    # ensures the dashboard re-renders whenever the cache is refreshed.
     return build_dashboard(campaign, monthly_goal=goal)
+
+
+# ── Data refresh ──────────────────────────────────────────────────────────
+# Fires on the hourly heartbeat (auto-refresh) or when the user clicks the
+# manual refresh button. In both cases we force a re-pull from BigQuery and
+# publish the new load timestamp to data-refresh-store, which cascades to
+# the dashboard re-render (via _render above) and the timestamp label.
+@app.callback(
+    Output("data-refresh-store", "data"),
+    Input("refresh-button", "n_clicks"),
+    Input("refresh-heartbeat", "n_intervals"),
+)
+def _refresh_data(_n_clicks, n_intervals):
+    trigger = ctx.triggered_id
+    # On initial page load the heartbeat "fires" with n_intervals=0 — that's
+    # not a real refresh, just seed the store with the already-warm cache.
+    force = trigger == "refresh-button" or (trigger == "refresh-heartbeat" and n_intervals and n_intervals > 0)
+    _, loaded_at = get_raw_df(force=force)
+    return loaded_at.isoformat()
+
+
+@app.callback(
+    Output("last-refresh-label", "children"),
+    Input("data-refresh-store", "data"),
+)
+def _update_refresh_label(ts_iso):
+    if not ts_iso:
+        return "Data as of —"
+    ts = pd.Timestamp(ts_iso)
+    # `%-d` / `%-I` drops leading zeros on POSIX — fall back gracefully if
+    # we ever end up on Windows.
+    try:
+        stamp = ts.strftime("%b %-d · %-I:%M %p PT")
+    except ValueError:
+        stamp = ts.strftime("%b %d · %I:%M %p PT")
+    return f"Data as of {stamp}"
 
 
 # ── Run ────────────────────────────────────────────────────────────────────
