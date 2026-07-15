@@ -56,6 +56,12 @@ CAMPAIGN_LABELS = {
 
 DEFAULT_CAMPAIGN = "jolly"
 
+# Extrapolating a full-month total from the first day or two of receipts
+# multiplies noise by ~15-30x (small denominator in raised / share). We
+# suppress the projected-total number, the pill, and the chart projection
+# line until enough data has accumulated to make a projection meaningful.
+MIN_PROJECTION_DAY = 3
+
 # ── Client + cached data load ──────────────────────────────────────────────
 # The whole view is fetched once and cached in-memory. Every dropdown / goal
 # change filters this cached frame — no BigQuery round-trip per interaction.
@@ -74,15 +80,21 @@ _data_cache: dict = {"df": None, "loaded_at": None}
 
 
 def _load_raw_df() -> pd.DataFrame:
-    """Blocking BigQuery pull + type normalization. Runs on refresh."""
+    """Blocking BigQuery pull + type normalization. Runs on refresh.
+
+    The underlying view pre-aggregates to (source_campaign, date, amount)
+    with SUM(amount) per day. That collapses potentially millions of
+    transaction rows into a few hundred, which is a big memory win on
+    small Render instances. We keep the downstream column name
+    `actblue_custom_date` so the rest of the code doesn't need to change.
+    """
     df = bq_client.query(f"""
-        SELECT source_campaign, actblue_custom_date, amount, recurs
+        SELECT source_campaign, date AS actblue_custom_date, amount
         FROM `{table_id}`
     """).to_dataframe()
-    df["actblue_custom_date"] = pd.to_datetime(
-        df["actblue_custom_date"], format="%Y-%m-%d %H:%M:%S"
-    )
-    df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
+    df["actblue_custom_date"] = pd.to_datetime(df["actblue_custom_date"])
+    df["amount"] = pd.to_numeric(df["amount"], errors="coerce").astype("float32")
+    df["source_campaign"] = df["source_campaign"].astype("category")
     return df
 
 
@@ -305,8 +317,11 @@ def build_dashboard(campaign: str, monthly_goal: int | None = None):
     # back to a naive linear extrapolation only when S is unreliably small
     # (e.g. day 1 of the month). When there's no history, avg_curve is
     # linear so this collapses to the naive projection automatically.
+    # `projection_ready` gates whether we surface the number to viewers —
+    # extrapolating from day 1 or 2 of the month is too noisy to show.
     _t_today           = day_of_month / days_in_month
     _smart_share_today = float(np.interp(_t_today, _COMMON_GRID, avg_curve))
+    projection_ready   = day_of_month >= MIN_PROJECTION_DAY
     if _smart_share_today > 0.001:
         projected_total = raised_mtd / _smart_share_today
     else:
@@ -405,12 +420,15 @@ def build_dashboard(campaign: str, monthly_goal: int | None = None):
         hovertemplate="<b>Goal pace</b>: $%{y:,.0f}<extra></extra>",
         showlegend=True, name="Goal Pace",
     ))
-    smart_spark_fig.add_trace(go.Scatter(
-        x=forecast_dates, y=smart_forecast,
-        mode="lines", line=dict(color=ACCENT2, width=2, dash="dot"),
-        hovertemplate="<b>Projected</b>: $%{y:,.0f}<extra></extra>",
-        showlegend=True, name="Projection",
-    ))
+    # Only show the projection line once enough data has accumulated to make
+    # the extrapolation meaningful (see MIN_PROJECTION_DAY).
+    if projection_ready:
+        smart_spark_fig.add_trace(go.Scatter(
+            x=forecast_dates, y=smart_forecast,
+            mode="lines", line=dict(color=ACCENT2, width=2, dash="dot"),
+            hovertemplate="<b>Projected</b>: $%{y:,.0f}<extra></extra>",
+            showlegend=True, name="Projection",
+        ))
     smart_spark_fig.add_trace(go.Scatter(
         x=[month_start_date, month_end_date],
         y=[monthly_goal, monthly_goal],
@@ -631,35 +649,65 @@ def build_dashboard(campaign: str, monthly_goal: int | None = None):
                 "borderRadius": "12px", "padding": "24px", "flex": "2", "minWidth": "560px",
             }),
 
-            # Projected total — its own card
+            # Projected total — its own card. On days 1 & 2 the projection
+            # is too noisy to show (see MIN_PROJECTION_DAY), so we render a
+            # placeholder instead of a wildly variable dollar number.
             html.Div([
                 html.P("PROJECTED TOTAL", style={
                     "fontFamily": FONT_MONO, "fontSize": "16px", "letterSpacing": "2px",
                     "textTransform": "uppercase", "color": TITLE_COLOR, "margin": "0 0 16px 0",
                     "borderBottom": f"1px solid {BORDER}", "paddingBottom": "12px",
                 }),
-                html.Div([
-                    html.Div(
-                        html.P(f"${projected_total:,.0f}", style={
-                            "fontFamily": FONT_TITLE, "fontSize": "44px", "color": TITLE_COLOR,
+                (
+                    html.Div([
+                        html.Div(
+                            html.P(f"${projected_total:,.0f}", style={
+                                "fontFamily": FONT_TITLE, "fontSize": "44px", "color": TITLE_COLOR,
+                                "margin": "0", "lineHeight": "1",
+                                "minHeight": "50px", "display": "flex", "alignItems": "flex-end",
+                            }),
+                            className="tt",
+                            title=(
+                                "Full EOM forecast estimates how much will be raised this month, "
+                                "taking into account the historical fundraising curve and the current "
+                                "fundraising total."
+                            ),
+                            style={"width": "fit-content"},
+                        ),
+                        html.Div(projected_pill_text,
+                            className="tt",
+                            title=(
+                                "Dollar difference between the projected EOM total and your monthly "
+                                "goal. Green means you're projecting above the goal, red means below."
+                            ),
+                            style={
+                                "display": "inline-block",
+                                "width": "fit-content",
+                                "fontFamily": FONT_MONO,
+                                "fontSize": "11px",
+                                "fontWeight": "400",
+                                "letterSpacing": "1.5px",
+                                "textTransform": "uppercase",
+                                "color": projected_pill_color,
+                                "background": projected_pill_bg,
+                                "padding": "6px 12px",
+                                "borderRadius": "999px",
+                                "marginTop": "12px",
+                                "border": f"1px solid {projected_pill_color}33",
+                            },
+                        ),
+                    ], style={
+                        "display": "flex", "flexDirection": "column",
+                        "justifyContent": "center", "height": "140px",
+                    })
+                    if projection_ready else
+                    html.Div([
+                        html.P("—", style={
+                            "fontFamily": FONT_TITLE, "fontSize": "44px", "color": MUTED,
                             "margin": "0", "lineHeight": "1",
                             "minHeight": "50px", "display": "flex", "alignItems": "flex-end",
                         }),
-                        className="tt",
-                        title=(
-                            "Full EOM forecast estimates how much will be raised this month, "
-                            "taking into account the historical fundraising curve and the current "
-                            "fundraising total."
-                        ),
-                        style={"width": "fit-content"},
-                    ),
-                    html.Div(projected_pill_text,
-                        className="tt",
-                        title=(
-                            "Dollar difference between the projected EOM total and your monthly "
-                            "goal. Green means you're projecting above the goal, red means below."
-                        ),
-                        style={
+                        html.Div(f"Available from day {MIN_PROJECTION_DAY}", style={
                             "display": "inline-block",
                             "width": "fit-content",
                             "fontFamily": FONT_MONO,
@@ -667,18 +715,26 @@ def build_dashboard(campaign: str, monthly_goal: int | None = None):
                             "fontWeight": "400",
                             "letterSpacing": "1.5px",
                             "textTransform": "uppercase",
-                            "color": projected_pill_color,
-                            "background": projected_pill_bg,
+                            "color": LABEL_COLOR,
+                            "background": SURFACE2,
                             "padding": "6px 12px",
                             "borderRadius": "999px",
                             "marginTop": "12px",
-                            "border": f"1px solid {projected_pill_color}33",
+                            "border": f"1px solid {BORDER}",
+                        }),
+                    ],
+                        className="tt",
+                        title=(
+                            "Projections are hidden for the first couple days of the month "
+                            "because extrapolating a full month's total from so little data "
+                            f"produces wildly variable numbers. Check back on day {MIN_PROJECTION_DAY}."
+                        ),
+                        style={
+                            "display": "flex", "flexDirection": "column",
+                            "justifyContent": "center", "height": "140px",
                         },
-                    ),
-                ], style={
-                    "display": "flex", "flexDirection": "column",
-                    "justifyContent": "center", "height": "140px",
-                }),
+                    )
+                ),
             ], style={
                 "background": SURFACE, "border": f"1px solid {BORDER}",
                 "borderRadius": "12px", "padding": "24px", "flex": "1", "minWidth": "280px",
